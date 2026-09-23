@@ -1,0 +1,14 @@
+# Never commit updater signing secrets
+*.key
+*.pem
+*.p12
+*.pfx
+*.asc
+signing-secrets/
+secrets/
+.env
+.env.*
+
+# Release assets belong in GitHub Releases, not Git history
+*.exe
+*.exe.sig
