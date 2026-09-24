@@ -75,6 +75,8 @@ jobs:
           path: upstream
           fetch-depth: 1
           persist-credentials: false
+      - name: Verify package-scoped Agent test selection
+        run: node maintenance-expanded/scripts/check-agent-test-selection.mjs maintenance-expanded upstream
       - name: Pin upstream commit and download fixed baseline
         shell: pwsh
         run: |
