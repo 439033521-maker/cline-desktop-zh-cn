@@ -67,6 +67,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Migration script syntax failed' }
           node --test maintenance-expanded/pipeline/phase3/auto-migrate.test.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Migration scanner regression failed' }
+      - name: Verify final NSIS payload gate regression
+        shell: pwsh
+        run: |
+          node --check maintenance-expanded/scripts/inspect-nsis-payload.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS payload gate syntax failed' }
+          node --test maintenance-expanded/scripts/inspect-nsis-payload.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS payload gate regression failed' }
       - name: Fresh official Desktop checkout
         uses: actions/checkout@v4
         with:
