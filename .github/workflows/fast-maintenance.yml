@@ -60,6 +60,13 @@ jobs:
       - name: Expand public maintenance package
         shell: pwsh
         run: Expand-Archive maintenance-package.zip -DestinationPath maintenance-expanded
+      - name: Verify migration scanner regression
+        shell: pwsh
+        run: |
+          node --check maintenance-expanded/pipeline/phase3/auto-migrate.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Migration script syntax failed' }
+          node --test maintenance-expanded/pipeline/phase3/auto-migrate.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Migration scanner regression failed' }
       - name: Fresh official Desktop checkout
         uses: actions/checkout@v4
         with:
