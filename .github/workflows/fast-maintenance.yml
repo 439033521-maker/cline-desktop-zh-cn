@@ -1,0 +1,159 @@
+name: Cline Chinese fast maintenance candidate
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Stable Desktop version (empty = official stable feed)'
+        required: false
+        type: string
+      force:
+        description: 'Rebuild even when an unexpired candidate exists'
+        required: false
+        default: false
+        type: boolean
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: cline-chinese-fast-maintenance
+  cancel-in-progress: false
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.version.outputs.build }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      artifactName: ${{ steps.version.outputs.artifactName }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify public maintenance package
+        run: sha256sum -c maintenance-package.sha256
+      - name: Expand public maintenance package
+        run: unzip -q maintenance-package.zip -d maintenance-expanded
+      - name: Compare stable Desktop feeds and existing candidate
+        id: version
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          FORCE_BUILD: ${{ inputs.force }}
+        run: node maintenance-expanded/scripts/detect-upstream.mjs
+  candidate:
+    needs: detect
+    if: needs.detect.outputs.build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+    env:
+      BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-install-cache
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify public maintenance package
+        shell: pwsh
+        run: |
+          $expected = (Get-Content maintenance-package.sha256 -Raw).Split(' ')[0]
+          if ((Get-FileHash maintenance-package.zip -Algorithm SHA256).Hash -ne $expected) { throw 'Public maintenance package hash mismatch' }
+      - name: Expand public maintenance package
+        shell: pwsh
+        run: Expand-Archive maintenance-package.zip -DestinationPath maintenance-expanded
+      - name: Fresh official Desktop checkout
+        uses: actions/checkout@v4
+        with:
+          repository: cline/cline
+          ref: ${{ needs.detect.outputs.tag }}
+          path: upstream
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Pin upstream commit and download fixed baseline
+        shell: pwsh
+        run: |
+          $commit = (& git -C upstream rev-parse HEAD).Trim()
+          if ($commit -notmatch '^[0-9a-f]{40}$') { throw 'Invalid upstream commit' }
+          "UPSTREAM_COMMIT=$commit" >> $env:GITHUB_ENV
+          $url = 'https://github.com/cline/cline/archive/refs/tags/desktop-v0.0.33.tar.gz'
+          Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP/baseline-0.0.33.tar.gz"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.13'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Migrate and run static checks before dependency install
+        shell: pwsh
+        run: |
+          node maintenance-expanded/scripts/prepare-source.mjs maintenance-expanded work upstream "$env:RUNNER_TEMP/baseline-0.0.33.tar.gz"
+          if ($LASTEXITCODE -ne 0) { throw 'Migration fail-fast gate failed' }
+          node maintenance-expanded/scripts/create-candidate-config.mjs maintenance-expanded work/resolved
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate updater identity gate failed' }
+          Push-Location work/resolved/apps/examples/desktop-app
+          bun run scripts/i18n/check.ts
+          if ($LASTEXITCODE -ne 0) { throw 'i18n coverage failed' }
+          Pop-Location
+      - name: Restore Bun package cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUN_INSTALL_CACHE_DIR }}
+          key: windows-bun-1.3.13-${{ hashFiles('upstream/bun.lock') }}
+          restore-keys: windows-bun-1.3.13-
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: work/resolved/apps/examples/desktop-app/src-tauri -> target
+          prefix-key: cline-chinese-windows
+          shared-key: ${{ hashFiles('upstream/apps/examples/desktop-app/src-tauri/Cargo.lock') }}
+      - name: Seed official Bun remote-helper runtime cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(bun --version)"
+          cache="${RUNNER_TEMP//\\//}/bun-install-cache"
+          mkdir -p "$cache"
+          for target in linux-x64-baseline linux-aarch64; do
+            work="$(mktemp -d)"
+            (cd "$work" && npm pack "@oven/bun-$target@$version" --silent >/dev/null && tar -xzf ./*.tgz package/bin/bun)
+            mv "$work/package/bin/bun" "$cache/bun-$target-v$version"
+          done
+          echo "BUN_INSTALL_CACHE_DIR=$cache" >> "$GITHUB_ENV"
+      - name: Install UPX and official NSIS distribution
+        shell: pwsh
+        run: |
+          choco install upx --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw 'UPX install failed' }
+          $zip = Join-Path $env:RUNNER_TEMP 'nsis.zip'
+          Invoke-WebRequest 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip' -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA1).Hash -ne 'EF7FF767E5CBD9EDD22ADD3A32C9B8F4500BB10D') { throw 'NSIS checksum mismatch' }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          "MAKENSIS_PATH=$env:RUNNER_TEMP/nsis-3.11/makensis.exe" >> $env:GITHUB_ENV
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test and build unsigned NSIS candidate
+        shell: pwsh
+        run: |
+          & maintenance-expanded/scripts/run-build.ps1 -Maintenance maintenance-expanded -Work work -UpstreamCommit $env:UPSTREAM_COMMIT -MaintenanceCommit '${{ github.sha }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate build failed' }
+      - name: Upload unsigned candidate and reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.detect.outputs.artifactName }}
+          path: work/candidate/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload successful timing and migration report
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-report-${{ needs.detect.outputs.version }}-${{ github.run_id }}
+          path: work/report/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload minimal intervention package on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-intervention-${{ needs.detect.outputs.version }}-${{ github.run_id }}
+          path: work/report/*
+          if-no-files-found: ignore
+          retention-days: 30
